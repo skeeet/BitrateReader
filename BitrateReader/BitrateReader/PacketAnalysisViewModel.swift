@@ -33,6 +33,12 @@ class PacketAnalysisViewModel: ObservableObject {
     private let analyzer = VideoPacketAnalyzer()
     private var analysisTask: Task<Void, Never>?
 
+    // Track security-scoped resource access for sandboxed file operations
+    private var isAccessingSecurityScopedResource = false
+
+    // Throttle progress updates to avoid creating thousands of short-lived Tasks
+    private var lastProgressUpdate: Date = .distantPast
+
     // MARK: - Computed Properties
 
     var isAnalyzing: Bool {
@@ -51,34 +57,56 @@ class PacketAnalysisViewModel: ObservableObject {
 
     // MARK: - Public Methods
 
-    /// Starts analysis of a video file
+    // Required for drag-and-drop files in sandboxed apps
+    // Must be balanced with stopAccessingResource to avoid resource leaks
+    func startAccessingResource() {
+        guard let url = selectedFileURL else { return }
+        if url.startAccessingSecurityScopedResource() {
+            isAccessingSecurityScopedResource = true
+        }
+    }
+
+    private func stopAccessingResource() {
+        guard isAccessingSecurityScopedResource, let url = selectedFileURL else { return }
+        url.stopAccessingSecurityScopedResource()
+        isAccessingSecurityScopedResource = false
+    }
+
     func analyzeFile(at url: URL) {
         guard canSelectFile else { return }
+
+        stopAccessingResource()
 
         selectedFileURL = url
         state = .loadingMetadata
 
-        // Cancel any existing analysis
         analysisTask?.cancel()
+        lastProgressUpdate = .distantPast
 
-        // Start new analysis task
         analysisTask = Task {
             do {
-                // Update to analyzing state
                 await MainActor.run {
                     self.state = .analyzing(progress: 0.0)
                 }
 
-                // Perform analysis with progress updates
                 let result = try await analyzer.analyze(url: url) { progress in
-                    Task { @MainActor in
-                        if case .analyzing = self.state {
-                            self.state = .analyzing(progress: progress)
+                    Task { @MainActor [weak self] in
+                        guard let self = self else { return }
+
+                        // Throttle to 10 updates/sec - video files can have 60,000+ packets
+                        // Without throttling, we'd create a Task for every packet (huge overhead)
+                        let now = Date()
+                        let timeSinceLastUpdate = now.timeIntervalSince(self.lastProgressUpdate)
+
+                        if timeSinceLastUpdate >= 0.1 || progress >= 1.0 {
+                            if case .analyzing = self.state {
+                                self.state = .analyzing(progress: progress)
+                                self.lastProgressUpdate = now
+                            }
                         }
                     }
                 }
 
-                // Check if task was cancelled
                 if Task.isCancelled {
                     await MainActor.run {
                         self.state = .failed(message: "Analysis was cancelled")
@@ -86,7 +114,6 @@ class PacketAnalysisViewModel: ObservableObject {
                     return
                 }
 
-                // Update to finished state
                 await MainActor.run {
                     self.state = .finished(
                         packets: result.packets,
@@ -97,27 +124,29 @@ class PacketAnalysisViewModel: ObservableObject {
             } catch let error as AnalysisError {
                 await MainActor.run {
                     self.state = .failed(message: error.localizedDescription)
+                    self.stopAccessingResource()
                 }
             } catch {
                 await MainActor.run {
                     self.state = .failed(message: "An unexpected error occurred: \(error.localizedDescription)")
+                    self.stopAccessingResource()
                 }
             }
         }
     }
 
-    /// Resets the analysis state to idle
     func reset() {
         analysisTask?.cancel()
         analysisTask = nil
+        stopAccessingResource()
         state = .idle
         selectedFileURL = nil
     }
 
-    /// Cancels the current analysis
     func cancelAnalysis() {
         analysisTask?.cancel()
         analysisTask = nil
+        stopAccessingResource()
         state = .idle
     }
 }

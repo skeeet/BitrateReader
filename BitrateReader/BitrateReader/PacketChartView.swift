@@ -12,30 +12,55 @@ import CoreMedia
 /// View for displaying packet size data as a chart
 struct PacketChartView: View {
 
+    // MARK: - Static Constants
+
+    // Shared formatter for thread safety and performance - ByteCountFormatter is expensive to create
+    private static let byteFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .binary
+        formatter.allowedUnits = [.useBytes, .useKB, .useMB]
+        return formatter
+    }()
+
+    // MARK: - Properties
+
     let packets: [PacketSample]
     let metadata: VideoMetadata
 
     @State private var showKeyframes: Bool = true
-    @State private var zoomLevel: Double = 1.0  // 1.0 = full view, higher = zoomed in
-    @State private var panOffset: Double = 0.0  // 0.0 to 1.0, position in timeline
-    @State private var selectedTime: Double? = nil  // Currently hovered time position
+    @State private var hideKeyframePackets: Bool = false
+    @State private var zoomLevel: Double = 1.0
+    @State private var panOffset: Double = 0.0
+    @State private var selectedTime: Double? = nil
 
-    // Debouncing for smooth pan/zoom
     @State private var debouncedZoom: Double = 1.0
     @State private var debouncedPan: Double = 0.0
     @State private var debounceTask: Task<Void, Never>?
 
-    // Cached statistics (computed once during init)
+    // Cached to avoid recomputing on every UI update - only changes when zoom/pan changes
+    @State private var cachedDisplayPackets: [PacketSample] = []
+
+    // Pre-computed statistics to avoid O(n) recalculation on every render
     private let cachedMinSize: Int64
     private let cachedMaxSize: Int64
     private let cachedAvgSize: Int64
     private let cachedAvgBitrate: Int64
+    private let cachedKeyframeCount: Int
+    private let cachedKeyframePercent: Double
+
+    // ProRes/DNxHD have every frame as keyframe - rendering all is slow and meaningless
+    private let isAllIntraCodec: Bool
+
+    // GOP (Group of Pictures) analysis - only meaningful for inter-frame codecs
+    private let gopCount: Int
+    private let gopAvgSize: Double
+    private let gopMinSize: Int
+    private let gopMaxSize: Int
 
     init(packets: [PacketSample], metadata: VideoMetadata) {
         self.packets = packets
         self.metadata = metadata
 
-        // Pre-compute statistics once - filter out invalid packets (no time or zero size)
         let valid = packets.filter { $0.timeInSeconds != nil && $0.sizeBytes > 0 }
         if !valid.isEmpty {
             cachedMinSize = valid.map(\.sizeBytes).min() ?? 0
@@ -50,22 +75,63 @@ struct PacketChartView: View {
             } else {
                 cachedAvgBitrate = 0
             }
+
+            cachedKeyframeCount = valid.filter(\.isKeyframe).count
+            cachedKeyframePercent = Double(cachedKeyframeCount) / Double(valid.count) * 100.0
+
+            // >90% threshold accounts for potential decoding artifacts while catching ProRes/DNxHD
+            isAllIntraCodec = cachedKeyframePercent > 90.0
+
+            // Analyze GOP structure for inter-frame codecs
+            if !isAllIntraCodec && cachedKeyframeCount > 1 {
+                let keyframeIndices = valid.enumerated()
+                    .filter { $0.element.isKeyframe }
+                    .map { $0.offset }
+
+                var gopSizes: [Int] = []
+                for i in 0..<(keyframeIndices.count - 1) {
+                    let gopSize = keyframeIndices[i + 1] - keyframeIndices[i]
+                    gopSizes.append(gopSize)
+                }
+
+                if !gopSizes.isEmpty {
+                    gopCount = gopSizes.count
+                    gopMinSize = gopSizes.min() ?? 0
+                    gopMaxSize = gopSizes.max() ?? 0
+                    gopAvgSize = Double(gopSizes.reduce(0, +)) / Double(gopSizes.count)
+                } else {
+                    gopCount = 0
+                    gopMinSize = 0
+                    gopMaxSize = 0
+                    gopAvgSize = 0
+                }
+            } else {
+                gopCount = 0
+                gopMinSize = 0
+                gopMaxSize = 0
+                gopAvgSize = 0
+            }
         } else {
             cachedMinSize = 0
             cachedMaxSize = 0
             cachedAvgSize = 0
             cachedAvgBitrate = 0
+            cachedKeyframeCount = 0
+            cachedKeyframePercent = 0
+            isAllIntraCodec = false
+            gopCount = 0
+            gopMinSize = 0
+            gopMaxSize = 0
+            gopAvgSize = 0
         }
     }
 
     // MARK: - Computed Properties
 
-    /// Filter out invalid packets and prepare for display
     private var validPackets: [PacketSample] {
         packets.filter { $0.timeInSeconds != nil && $0.sizeBytes > 0 }
     }
 
-    /// Calculate visible time range based on zoom and pan (uses debounced values)
     private var visibleTimeRange: ClosedRange<Double> {
         let allTimes = validPackets.compactMap { $0.timeInSeconds }
         guard !allTimes.isEmpty,
@@ -76,8 +142,6 @@ struct PacketChartView: View {
 
         let totalDuration = fullMax - fullMin
         let visibleDuration = totalDuration / debouncedZoom
-
-        // Calculate start position based on pan offset
         let maxPanOffset = max(0, totalDuration - visibleDuration)
         let startTime = fullMin + (maxPanOffset * debouncedPan)
         let endTime = min(fullMax, startTime + visibleDuration)
@@ -85,26 +149,37 @@ struct PacketChartView: View {
         return startTime...endTime
     }
 
-    /// Debounce zoom/pan updates to avoid expensive recalculations
     private func updateDebounced() {
+        // Capture current values to avoid race condition if state changes during Task execution
+        let currentZoom = zoomLevel
+        let currentPan = panOffset
+
         debounceTask?.cancel()
-        debounceTask = Task {
-            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms debounce
+        debounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 50_000_000)
             if !Task.isCancelled {
-                debouncedZoom = zoomLevel
-                debouncedPan = panOffset
+                debouncedZoom = currentZoom
+                debouncedPan = currentPan
             }
         }
     }
 
-    /// Get packets within visible time range and downsample intelligently
     private var displayPackets: [PacketSample] {
+        cachedDisplayPackets
+    }
+
+    private func computeDisplayPackets() -> [PacketSample] {
         let visibleRange = visibleTimeRange
 
-        // Filter to visible packets and sort by presentation time
         let visiblePackets = validPackets
             .filter { packet in
                 guard let time = packet.timeInSeconds else { return false }
+
+                // Filter out keyframes if requested (useful for analyzing P/B-frame patterns)
+                if hideKeyframePackets && packet.isKeyframe {
+                    return false
+                }
+
                 return visibleRange.contains(time)
             }
             .sorted { packet1, packet2 in
@@ -115,11 +190,9 @@ struct PacketChartView: View {
                 return time1 < time2
             }
 
-        // Smart downsampling based on chart width (assume ~800px width)
         let chartWidth = 800.0
         let pixelsPerPacket = chartWidth / Double(visiblePackets.count)
 
-        // If more than 2 packets per pixel, aggregate into buckets
         if pixelsPerPacket < 0.5 {
             return aggregateIntoBuckets(visiblePackets, targetBuckets: Int(chartWidth))
         }
@@ -139,12 +212,10 @@ struct PacketChartView: View {
         cachedAvgSize
     }
 
-    /// Calculate average bitrate in bits per second
     private var averageBitrate: Int64 {
         cachedAvgBitrate
     }
 
-    /// Format bitrate for display (Mbps or Kbps)
     private var bitrateString: String {
         let bitrate = averageBitrate
         if bitrate >= 1_000_000 {
@@ -156,7 +227,6 @@ struct PacketChartView: View {
         }
     }
 
-    /// Find the nearest packet to the selected time
     private var selectedPacket: PacketSample? {
         guard let time = selectedTime else { return nil }
 
@@ -180,9 +250,7 @@ struct PacketChartView: View {
         let minSize = minPacketSize
         let maxSize = maxPacketSize
         let range = maxSize - minSize
-        // Add a small padding at the bottom (0 or min - 10%)
         let paddedMin = Swift.max(Int64(0), minSize - range / 10)
-        // Add padding at the top (max + 10%)
         let paddedMax = maxSize + range / 10
         return paddedMin...paddedMax
     }
@@ -191,7 +259,6 @@ struct PacketChartView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Navigation controls
             VStack(alignment: .leading, spacing: 8) {
                 zoomControlsSection
             }
@@ -200,25 +267,31 @@ struct PacketChartView: View {
 
             Divider()
 
-            // Chart (takes all available space, min 200px)
             chartSection
                 .frame(minHeight: 200, maxHeight: .infinity)
                 .padding()
 
             Divider()
 
-            // Stats and codec info
             VStack(alignment: .leading, spacing: 12) {
-                // Metadata (codec, duration, etc)
                 metadataSection
-
                 Divider()
-
-                // Statistics
                 statisticsSection
             }
             .padding()
             .background(Color(NSColor.controlBackgroundColor).opacity(0.3))
+        }
+        .onAppear {
+            cachedDisplayPackets = computeDisplayPackets()
+        }
+        .onChange(of: debouncedZoom) {
+            cachedDisplayPackets = computeDisplayPackets()
+        }
+        .onChange(of: debouncedPan) {
+            cachedDisplayPackets = computeDisplayPackets()
+        }
+        .onChange(of: hideKeyframePackets) {
+            cachedDisplayPackets = computeDisplayPackets()
         }
     }
 
@@ -249,15 +322,12 @@ struct PacketChartView: View {
     private var zoomControlsSection: some View {
         VStack(spacing: 8) {
             HStack(spacing: 12) {
-                // Zoom label
                 Text("Zoom:")
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                // Zoom out button
                 Button(action: {
                     zoomLevel = max(1.0, zoomLevel / 2.0)
-                    // Reset pan when zooming out to full view
                     if zoomLevel == 1.0 {
                         panOffset = 0.0
                     }
@@ -270,13 +340,11 @@ struct PacketChartView: View {
                 .controlSize(.small)
                 .disabled(zoomLevel <= 1.0)
 
-                // Zoom level display
                 Text(String(format: "%.1fx", zoomLevel))
                     .font(.caption)
                     .foregroundColor(.secondary)
                     .frame(width: 40)
 
-                // Zoom in button
                 Button(action: {
                     zoomLevel = min(100.0, zoomLevel * 2.0)
                     updateDebounced()
@@ -287,7 +355,6 @@ struct PacketChartView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
 
-                // Reset button
                 Button(action: {
                     zoomLevel = 1.0
                     panOffset = 0.0
@@ -303,25 +370,44 @@ struct PacketChartView: View {
 
                 Spacer()
 
-                // Show packet count info
                 Text("\(displayPackets.count) points displayed")
                     .font(.caption)
                     .foregroundColor(.secondary)
 
-                // Keyframe toggle
-                Toggle(isOn: $showKeyframes) {
+                if isAllIntraCodec {
                     HStack(spacing: 4) {
-                        Image(systemName: "key.fill")
+                        Image(systemName: "info.circle")
                             .font(.caption)
-                        Text("Keyframes")
+                            .foregroundColor(.secondary)
+                        Text("All frames are keyframes")
                             .font(.caption)
+                            .foregroundColor(.secondary)
                     }
+                } else {
+                    Toggle(isOn: $showKeyframes) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "key.fill")
+                                .font(.caption)
+                            Text("Keyframe Markers")
+                                .font(.caption)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+
+                    Toggle(isOn: $hideKeyframePackets) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "eye.slash")
+                                .font(.caption)
+                            Text("Hide I-Frames")
+                                .font(.caption)
+                        }
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
                 }
-                .toggleStyle(.switch)
-                .controlSize(.small)
             }
 
-            // Pan slider (only show when zoomed in)
             if zoomLevel > 1.0 {
                 HStack(spacing: 8) {
                     Image(systemName: "chevron.left")
@@ -343,8 +429,10 @@ struct PacketChartView: View {
     }
 
     private var chartSection: some View {
-        Chart {
-            // Draw packet size line
+        // Only show keyframe markers if markers are enabled, not all-intra, and we're not hiding keyframes
+        let keyframePackets = (showKeyframes && !isAllIntraCodec && !hideKeyframePackets) ? displayPackets.filter { $0.isKeyframe } : []
+
+        return Chart {
             ForEach(displayPackets) { packet in
                 if let timeSeconds = packet.timeInSeconds {
                     LineMark(
@@ -356,23 +444,15 @@ struct PacketChartView: View {
                 }
             }
 
-            // Draw keyframe markers (if enabled)
-            if showKeyframes {
-                ForEach(displayPackets.filter { $0.isKeyframe }) { packet in
+            if showKeyframes && !isAllIntraCodec && !hideKeyframePackets {
+                ForEach(keyframePackets) { packet in
                     if let timeSeconds = packet.timeInSeconds {
-                        // Vertical line for keyframe
                         RuleMark(
                             x: .value("Keyframe", timeSeconds)
                         )
-                        .foregroundStyle(Color.red.opacity(0.3))
-                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [5, 3]))
-                        .annotation(position: .top, alignment: .center) {
-                            Image(systemName: "key.fill")
-                                .font(.system(size: 8))
-                                .foregroundColor(.red.opacity(0.6))
-                        }
+                        .foregroundStyle(Color.red.opacity(0.25))
+                        .lineStyle(StrokeStyle(lineWidth: 1))
 
-                        // Highlight point for keyframe
                         PointMark(
                             x: .value("Time", timeSeconds),
                             y: .value("Size", packet.sizeBytes)
@@ -383,9 +463,7 @@ struct PacketChartView: View {
                 }
             }
 
-            // Show selected packet on hover
             if let packet = selectedPacket, let timeSeconds = packet.timeInSeconds {
-                // Vertical line at cursor
                 RuleMark(x: .value("Selected", timeSeconds))
                     .foregroundStyle(Color.gray.opacity(0.5))
                     .lineStyle(StrokeStyle(lineWidth: 1))
@@ -414,7 +492,6 @@ struct PacketChartView: View {
                         .shadow(radius: 4)
                     }
 
-                // Highlight point at cursor
                 PointMark(
                     x: .value("Time", timeSeconds),
                     y: .value("Size", packet.sizeBytes)
@@ -461,15 +538,40 @@ struct PacketChartView: View {
                 statisticItem(label: "Min Size", value: formatBytes(minPacketSize))
                 statisticItem(label: "Max Size", value: formatBytes(maxPacketSize))
                 statisticItem(label: "Average Size", value: formatBytes(averagePacketSize))
-
-                let keyframeCount = validPackets.filter(\.isKeyframe).count
-                let keyframePercent = validPackets.isEmpty ? 0 : (Double(keyframeCount) / Double(validPackets.count) * 100.0)
                 statisticItem(
                     label: "Keyframes",
-                    value: "\(keyframeCount) (\(String(format: "%.1f%%", keyframePercent)))"
+                    value: "\(cachedKeyframeCount) (\(String(format: "%.1f%%", cachedKeyframePercent)))"
                 )
             }
             .font(.caption)
+
+            // GOP structure info - only for inter-frame codecs
+            if !isAllIntraCodec && gopCount > 0 {
+                Divider()
+                    .padding(.vertical, 4)
+
+                Text("GOP Structure")
+                    .font(.headline)
+
+                HStack(spacing: 30) {
+                    statisticItem(label: "GOP Count", value: "\(gopCount)")
+                    statisticItem(label: "Avg GOP Size", value: String(format: "%.1f frames", gopAvgSize))
+                    statisticItem(label: "Min GOP", value: "\(gopMinSize) frames")
+                    statisticItem(label: "Max GOP", value: "\(gopMaxSize) frames")
+
+                    if gopMinSize == gopMaxSize {
+                        statisticItem(label: "Pattern", value: "Fixed (\(gopMinSize))")
+                    } else {
+                        let variance = gopMaxSize - gopMinSize
+                        if variance <= 2 {
+                            statisticItem(label: "Pattern", value: "Mostly Fixed")
+                        } else {
+                            statisticItem(label: "Pattern", value: "Variable")
+                        }
+                    }
+                }
+                .font(.caption)
+            }
         }
     }
 
@@ -484,7 +586,6 @@ struct PacketChartView: View {
 
     // MARK: - Helper Methods
 
-    /// Safely converts Double to Int, returning nil if out of range
     private func safeIntConversion(_ value: Double) -> Int? {
         guard value.isFinite && value >= Double(Int.min) && value <= Double(Int.max) else {
             return nil
@@ -501,28 +602,42 @@ struct PacketChartView: View {
             .map { $0.element }
     }
 
-    /// Aggregates packets into time-based buckets, keeping the max size in each bucket
-    /// This prevents rendering thousands of points when zoomed out
+    // Aggregate packets into time buckets to reduce rendering overhead
+    // Strategy: keep the largest packet in each bucket to preserve bitrate spikes
     private func aggregateIntoBuckets(_ packets: [PacketSample], targetBuckets: Int) -> [PacketSample] {
         guard packets.count > targetBuckets, !packets.isEmpty else { return packets }
 
-        // Get time range
         let times = packets.compactMap { $0.timeInSeconds }
         guard let minTime = times.min(), let maxTime = times.max() else { return packets }
 
         let timeRange = maxTime - minTime
         let bucketDuration = timeRange / Double(targetBuckets)
 
-        // Use dictionary for sparse bucketing (more memory efficient)
+        // Dictionary allows sparse bucketing - memory efficient for zoomed views
         var buckets: [Int: PacketSample] = [:]
         buckets.reserveCapacity(targetBuckets)
 
-        // For each packet, keep only the max in each bucket
         for packet in packets {
             guard let time = packet.timeInSeconds else { continue }
-            let bucketIndex = min(Int((time - minTime) / bucketDuration), targetBuckets - 1)
 
-            // Keep the packet with max size in this bucket
+            let normalizedTime = time - minTime
+            guard normalizedTime >= 0, bucketDuration > 0 else { continue }
+
+            let rawIndex = normalizedTime / bucketDuration
+
+            // Defensive check: division by very small numbers can produce non-finite results
+            guard rawIndex.isFinite else { continue }
+
+            let bucketIndex: Int
+            if rawIndex < 0 {
+                bucketIndex = 0
+            } else if rawIndex >= Double(targetBuckets) {
+                bucketIndex = targetBuckets - 1
+            } else {
+                bucketIndex = Int(rawIndex)
+            }
+
+            // Keep largest packet per bucket to show worst-case bitrate
             if let existing = buckets[bucketIndex] {
                 if packet.sizeBytes > existing.sizeBytes {
                     buckets[bucketIndex] = packet
@@ -532,7 +647,6 @@ struct PacketChartView: View {
             }
         }
 
-        // Extract and sort by presentation time
         return buckets.values.sorted { packet1, packet2 in
             guard let time1 = packet1.timeInSeconds,
                   let time2 = packet2.timeInSeconds else {
@@ -543,10 +657,7 @@ struct PacketChartView: View {
     }
 
     private func formatBytes(_ bytes: Int64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .binary
-        formatter.allowedUnits = [.useBytes, .useKB, .useMB]
-        return formatter.string(fromByteCount: bytes)
+        Self.byteFormatter.string(fromByteCount: bytes)
     }
 
     private func formatTime(_ seconds: Double) -> String {
@@ -578,8 +689,7 @@ struct PacketChartView: View {
 
 #Preview {
     let samplePackets = (0..<100).map { i in
-        let time = CMTime(value: Int64(i * 33), timescale: 1000) // 33ms per frame
-        // Make every 30th frame a keyframe (simulating GOP structure)
+        let time = CMTime(value: Int64(i * 33), timescale: 1000)
         let isKeyframe = i % 30 == 0
         return PacketSample(
             index: i,

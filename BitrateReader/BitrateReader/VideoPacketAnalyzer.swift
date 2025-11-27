@@ -135,7 +135,8 @@ actor VideoPacketAnalyzer {
             throw AnalysisError.readerSetupFailed
         }
 
-        // Configure output for compressed samples (outputSettings = nil)
+        // outputSettings = nil is critical: gives us compressed packets without decoding
+        // This allows reading the actual encoded packet sizes rather than decoded frame sizes
         let output = AVAssetReaderTrackOutput(
             track: videoTrack,
             outputSettings: nil
@@ -148,7 +149,6 @@ actor VideoPacketAnalyzer {
 
         reader.add(output)
 
-        // Start reading
         guard reader.startReading() else {
             if let error = reader.error {
                 throw AnalysisError.readerFailed(error.localizedDescription)
@@ -156,36 +156,41 @@ actor VideoPacketAnalyzer {
             throw AnalysisError.readerStartFailed
         }
 
-        // Extract all packets
+        // Ensure reader cleanup on all exit paths (normal, error, cancellation)
+        defer {
+            if reader.status == .reading {
+                reader.cancelReading()
+            }
+        }
+
         var packets: [PacketSample] = []
         var index = 0
 
-        // Read samples in a loop (this is already async-friendly)
         while reader.status == .reading {
+            // Check cancellation early to avoid processing thousands of packets unnecessarily
+            if Task.isCancelled {
+                reader.cancelReading()
+                throw AnalysisError.cancelled
+            }
+
             guard let sampleBuffer = output.copyNextSampleBuffer() else {
                 break
             }
 
-            // Extract timestamp (keep as CMTime - rational time)
             let presentationTime = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
-            // Skip invalid timestamps
             guard CMTIME_IS_VALID(presentationTime) && CMTIME_IS_NUMERIC(presentationTime) else {
                 continue
             }
 
-            // Extract size (use Int64 for packet size)
             let sizeBytes = Int64(CMSampleBufferGetTotalSampleSize(sampleBuffer))
 
-            // Skip zero-byte packets (shouldn't exist for valid video frames)
             guard sizeBytes > 0 else {
                 continue
             }
 
-            // Detect if this is a keyframe (sync sample)
             let isKeyframe = isKeyframeSample(sampleBuffer)
 
-            // Create packet sample
             let packet = PacketSample(
                 index: index,
                 presentationTime: presentationTime,
@@ -194,7 +199,6 @@ actor VideoPacketAnalyzer {
             )
             packets.append(packet)
 
-            // Report progress (only convert to seconds for progress reporting)
             if let callback = progressCallback, duration > 0 {
                 let timeSeconds = CMTimeGetSeconds(presentationTime)
                 if timeSeconds.isFinite {
@@ -206,7 +210,6 @@ actor VideoPacketAnalyzer {
             index += 1
         }
 
-        // Check final status
         if reader.status == .failed {
             if let error = reader.error {
                 throw AnalysisError.readerFailed(error.localizedDescription)
@@ -216,13 +219,13 @@ actor VideoPacketAnalyzer {
             throw AnalysisError.cancelled
         }
 
-        // Sort packets by presentation time (PTS) to ensure correct order
-        // Files may store packets in decode order, but we display in presentation order
+        // Files may store packets in decode order (DTS), but we need presentation order (PTS)
+        // This is critical for B-frame codecs where decode order != display order
         let sortedPackets = packets.sorted { packet1, packet2 in
             CMTimeCompare(packet1.presentationTime, packet2.presentationTime) < 0
         }
 
-        // Re-index packets based on presentation order
+        // Re-index to match presentation order for UI display
         let reindexedPackets = sortedPackets.enumerated().map { (newIndex, packet) in
             PacketSample(
                 index: newIndex,
@@ -237,28 +240,21 @@ actor VideoPacketAnalyzer {
 
     // MARK: - Helper Methods
 
-    /// Checks if a sample buffer represents a keyframe (sync sample)
-    /// - Parameter sampleBuffer: The sample buffer to check
-    /// - Returns: True if this is a keyframe/I-frame, false otherwise
     private func isKeyframeSample(_ sampleBuffer: CMSampleBuffer) -> Bool {
-        // Get the sample attachments array
         guard let attachmentsArray = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
               let attachments = attachmentsArray.first else {
-            // If no attachments, assume it's a keyframe (safe default for first frame)
+            // No attachments = keyframe (common for first frame or all-intra codecs)
             return true
         }
 
-        // Check for kCMSampleAttachmentKey_NotSync
-        // If this key is missing or false, the sample is a sync/keyframe
         if let notSync = attachments[kCMSampleAttachmentKey_NotSync] as? Bool {
-            return !notSync  // If notSync is false, it IS a keyframe
+            return !notSync  // Key present: notSync=false means IS a keyframe
         }
 
-        // If the key is missing, it's a sync sample (keyframe)
+        // Key missing = sync sample by convention
         return true
     }
 
-    /// Converts a FourCharCode to a readable string
     private func fourCharCodeToString(_ code: FourCharCode) -> String {
         let bytes: [UInt8] = [
             UInt8((code >> 24) & 0xFF),

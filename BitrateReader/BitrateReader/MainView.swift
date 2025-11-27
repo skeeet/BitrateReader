@@ -18,10 +18,17 @@ struct MainView: View {
         switch viewModel.state {
         case .finished(_, let metadata):
             return metadata.fileName ?? "Video Packet Analyzer"
-        default:
+        case .analyzing:
             if let url = viewModel.selectedFileURL {
                 return url.lastPathComponent
             }
+            return "Video Packet Analyzer"
+        case .loadingMetadata:
+            if let url = viewModel.selectedFileURL {
+                return url.lastPathComponent
+            }
+            return "Video Packet Analyzer"
+        case .idle, .failed:
             return "Video Packet Analyzer"
         }
     }
@@ -236,15 +243,8 @@ struct MainView: View {
 
             print("Loaded file URL (in-place: \(isInPlace)): \(fileURL)")
 
-            // Start accessing the security-scoped resource
-            let didStartAccessing = fileURL.startAccessingSecurityScopedResource()
-            print("Started accessing security-scoped resource: \(didStartAccessing)")
-
             // Process the file at its original location
             self.processDroppedFile(fileURL)
-
-            // Note: We should stop accessing when done, but since analysis is async,
-            // we'll keep access for the duration of the app session
         }
 
         return true
@@ -260,6 +260,7 @@ struct MainView: View {
         if videoExtensions.contains(pathExtension) {
             DispatchQueue.main.async {
                 self.viewModel.analyzeFile(at: url)
+                self.viewModel.startAccessingResource()
             }
         } else {
             print("File is not a supported video format: \(pathExtension)")
